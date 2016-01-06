@@ -20,7 +20,7 @@ except ImportError:
 
 from tempfile import NamedTemporaryFile, mkdtemp
 from osc.fetch import *
-from osc.core import get_buildinfo, store_read_apiurl, store_read_project, store_read_package, meta_exists, quote_plus, get_buildconfig, is_package_dir
+from osc.core import get_preinstallimginfo, get_buildinfo, store_read_apiurl, store_read_project, store_read_package, meta_exists, quote_plus, get_buildconfig, is_package_dir
 from osc.core import get_binarylist, get_binary_file, run_external, raw_input
 from osc.util import rpmquery, debquery, archquery
 import osc.conf
@@ -32,6 +32,11 @@ except ImportError:
     import cElementTree as ET
 
 from .conf import config, cookiejar
+
+try:
+    from .meter import TextMeter
+except:
+    TextMeter = None
 
 change_personality = {
             'i686':  'linux32',
@@ -261,6 +266,71 @@ class Pac:
     def __repr__(self):
         return "%s" % self.name
 
+def get_preinstall_image(apiurl, proj, repo, arch, pkg, cache_dir, prefer_pkg, specfile=None):
+    """
+    Searches preinstall image according to build info and downloads it to cache.
+    Returns preinstall image path, source and list of image binaries, which can
+    be used to create rpmlist.
+    NOTE: preinstall image can be used only for new build roots!
+    """
+    imagefile = ''
+    imagesource = ''
+    img_bins = []
+    try:
+        img_info = get_preinstallimginfo(apiurl, proj, repo, arch, pkg, prefer_pkg, specfile)
+    except HTTPError as e:
+        return ('', '', [])
+
+    try:
+        root = ET.fromstring(img_info)
+    except:
+        print("could not parse preinstall image info!")
+        return ('', '', [])
+
+    for bin in root.findall('binaries'):
+        img_bins.append(bin.text)
+
+    img_hdrmd5 = root.find('hdrmd5').text
+    img_pkg = root.find('package').text
+    img_prpa = root.find('prpa').text
+    img_path = root.find('path').text
+    img_file = root.find('file').text
+    cache_path = '%s/%s' % (cache_dir, img_prpa)
+    ifile = "%s-%s.%s" % (img_hdrmd5, img_pkg, img_file)
+    ifile_path = '%s/%s' % (cache_path, ifile)
+    ifile_path_part = '%s.part' % ifile_path
+
+    imagefile = ifile_path
+    # strip arch from image source
+    idx = img_prpa.rfind('/')
+    imagesource = img_prpa[:idx]
+    imagesource += "/%s" % img_pkg
+    imagesource += " [%s]" % img_hdrmd5
+
+    if not os.path.exists(ifile_path):
+        url = "%s/build/%s/%s/%s" % (apiurl, img_prpa, img_pkg, img_file)
+        print("downloading preinstall image %s" %imagesource)
+        if not os.path.exists(cache_path):
+            try:
+                os.makedirs(cache_path, mode=0o755)
+            except OSError as e:
+                print('packagecachedir is not writable for you?', file=sys.stderr)
+                print(e, file=sys.stderr)
+                sys.exit(1)
+        if sys.stdout.isatty() and TextMeter:
+            progress_obj = TextMeter(fo=sys.stdout)
+        else:
+            progress_obj = None
+        gr = OscFileGrabber(progress_obj=progress_obj)
+        try:
+            gr.urlgrab(url, filename=ifile_path_part, text='fetching image')
+        except URLGrabError as e:
+            print("Failed to download! ecode:%i errno:%i" % (e.code, e.errno))
+            return ('', '', [])
+        # download ok, rename partial file to final file name
+        os.rename(ifile_path_part, ifile_path)
+
+    return (imagefile, imagesource, img_bins)
 
 
 def get_built_files(pacdir, buildtype):
@@ -781,6 +851,23 @@ def main(apiurl, opts, argv):
         # implicitly trust the project we are building for
         check_trusted_projects(apiurl, [ i for i in bi.projects.keys() if not i == prj ])
 
+    imagefile = ''
+    imagesource = ''
+    imagebins = []
+    # get preinstall image only if there are no other packages in build root
+    if (not config['no_preinstallimage'] and not opts.nopreinstallimage and
+        not opts.noinit and not opts.offline and
+        (opts.clean or (not os.path.exists(build_root + "/installed-pkg") and
+                        not os.path.exists(build_root + "/.build/init_buildsystem.data")))):
+        (imagefile, imagesource, imagebins) = get_preinstall_image(apiurl, prj, repo, arch, pac,
+                                                                   cache_dir, prefer_pkgs.keys(),
+                                                                   specfile=build_descr_data)
+
+    # remove binaries from build deps which are included in preinstall image, so those are not fetched to cache
+    for i in bi.deps:
+      if i.name in imagebins:
+        bi.remove_dep(i.name)
+
     # now update the package cache
     fetcher.run(bi)
 
@@ -977,11 +1064,24 @@ def main(apiurl, opts, argv):
 
     print('Writing build configuration')
 
+
+
     if build_type == 'kiwi':
         rpmlist = [ '%s %s\n' % (i.name, i.fullfilename) for i in bi.deps if not i.noinstall ]
     else:
-        rpmlist = [ '%s %s\n' % (i.name, i.fullfilename) for i in bi.deps ]
+        rpmlist = []
+        for i in bi.deps:
+            rpmlist.append('%s %s\n' % (i.name, i.fullfilename))
+
+    for i in imagebins:
+        rpmlist.append('%s preinstallimage\n' % i)
+
     rpmlist += [ '%s %s\n' % (i[0], i[1]) for i in rpmlist_prefers ]
+
+    if imagefile:
+        rpmlist.append('preinstallimage: %s\n' % imagefile)
+    if imagesource:
+        rpmlist.append('preinstallimagesource: %s\n' % imagesource)
 
     rpmlist.append('preinstall: ' + ' '.join(bi.preinstall_list) + '\n')
     rpmlist.append('vminstall: ' + ' '.join(bi.vminstall_list) + '\n')

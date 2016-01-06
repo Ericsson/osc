@@ -5838,6 +5838,20 @@ def get_buildinfo(apiurl, prj, package, repository, arch, specfile=None, addlist
         f = http_GET(u)
     return f.read()
 
+def get_preinstallimginfo(apiurl, prj, repository, arch, package, localpackages, specfile=None):
+    query = []
+    if localpackages:
+        for i in localpackages:
+            query.append('localpackage=%s' % quote_plus(i))
+
+    u = makeurl(apiurl, ['build', prj, repository, arch, package, '_preinstallimginfo'], query=query)
+
+    if specfile:
+        f = http_POST(u, data=specfile)
+    else:
+        f = http_GET(u)
+
+    return f.read()
 
 def get_buildconfig(apiurl, prj, repository):
     u = makeurl(apiurl, ['build', prj, repository, '_buildconfig'])
